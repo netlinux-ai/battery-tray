@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+Battery Charge Manager — systray indicator.
+
+Reads battery status from sysfs and writes charge_control_end_threshold
+(SMC BCLM key) directly via pkexec. No daemon needed — the setting
+persists in SMC NVRAM across reboots.
+"""
+
+import os
+import subprocess
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import Gtk, GLib, AyatanaAppIndicator3
+
+# ── sysfs paths ──────────────────────────────────────────────────────────
+BAT = "/sys/class/power_supply/BAT0"
+CHARGE_NOW = os.path.join(BAT, "charge_now")
+CHARGE_FULL = os.path.join(BAT, "charge_full")
+CHARGE_FULL_DESIGN = os.path.join(BAT, "charge_full_design")
+STATUS_FILE = os.path.join(BAT, "status")
+THRESHOLD_FILE = os.path.join(BAT, "charge_control_end_threshold")
+
+
+# ── helpers ──────────────────────────────────────────────────────────────
+def read_int(path):
+    with open(path) as f:
+        return int(f.read().strip())
+
+
+def read_str(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def battery_info():
+    """Return (percent_int, raw_pct_float, status, threshold, health)."""
+    now = read_int(CHARGE_NOW)
+    full = read_int(CHARGE_FULL)
+    design = read_int(CHARGE_FULL_DESIGN)
+    raw = (now / full * 100) if full else 0.0
+    pct = round(raw)
+    health = round(full / design * 100, 1) if design else 0.0
+    status = read_str(STATUS_FILE)
+    threshold = read_int(THRESHOLD_FILE)
+    return pct, raw, status, threshold, health
+
+
+def write_threshold(value):
+    """Write BCLM via pkexec. Returns True on success."""
+    r = subprocess.run(
+        ["pkexec", "bash", "-c", f"echo {int(value)} > {THRESHOLD_FILE}"],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def icon_for_level(level, charging):
+    suffix = "-charging" if charging else ""
+    return f"battery-level-{level}{suffix}-symbolic"
+
+
+def notify(summary, body="", urgency="normal"):
+    subprocess.Popen(
+        ["notify-send", f"--urgency={urgency}", summary, body],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+# ── Settings dialog ─────────────────────────────────────────────────────
+class SettingsDialog(Gtk.Window):
+    def __init__(self, app):
+        super().__init__(title="Battery Charge Manager", resizable=False)
+        self.app = app
+        self.set_border_width(12)
+        self.set_default_size(340, -1)
+        self.connect("delete-event", self._on_close)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.add(vbox)
+
+        # ── status ───────────────────────────────────────────────────
+        frame_s = Gtk.Frame(label="Current Status")
+        grid_s = Gtk.Grid(column_spacing=12, row_spacing=4, margin=8)
+        frame_s.add(grid_s)
+        vbox.pack_start(frame_s, False, False, 0)
+
+        self.lbl_charge = Gtk.Label(xalign=1)
+        self.lbl_status = Gtk.Label(xalign=1)
+        self.lbl_threshold = Gtk.Label(xalign=1)
+        self.lbl_health = Gtk.Label(xalign=1)
+        for i, (label, widget) in enumerate([
+            ("Charge:", self.lbl_charge),
+            ("Status:", self.lbl_status),
+            ("Charge limit:", self.lbl_threshold),
+            ("Health:", self.lbl_health),
+        ]):
+            l = Gtk.Label(xalign=0)
+            l.set_markup(f"<b>{label}</b>")
+            grid_s.attach(l, 0, i, 1, 1)
+            widget.set_hexpand(True)
+            grid_s.attach(widget, 1, i, 1, 1)
+
+        # ── charge limit ─────────────────────────────────────────────
+        frame_l = Gtk.Frame(label="Charge Limit (BCLM)")
+        grid_l = Gtk.Grid(column_spacing=8, row_spacing=6, margin=8)
+        frame_l.add(grid_l)
+        vbox.pack_start(frame_l, False, False, 0)
+
+        _, _, _, threshold, _ = battery_info()
+        limited = threshold < 100
+
+        self.adj_limit = Gtk.Adjustment(
+            value=threshold if limited else 80,
+            lower=20, upper=100,
+            step_increment=5, page_increment=10,
+        )
+        l = Gtk.Label(xalign=0)
+        l.set_markup("<b>Stop at:</b>")
+        grid_l.attach(l, 0, 0, 1, 1)
+
+        self.scale_limit = Gtk.Scale(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            adjustment=self.adj_limit, draw_value=False,
+        )
+        self.scale_limit.set_hexpand(True)
+        grid_l.attach(self.scale_limit, 1, 0, 1, 1)
+
+        self.spin_limit = Gtk.SpinButton(adjustment=self.adj_limit, digits=0)
+        grid_l.attach(self.spin_limit, 2, 0, 1, 1)
+        grid_l.attach(Gtk.Label(label="%"), 3, 0, 1, 1)
+
+        self.chk_enable = Gtk.CheckButton(label="Enable charge limit")
+        self.chk_enable.set_active(limited)
+        self.chk_enable.connect("toggled", self._on_enable_toggled)
+        vbox.pack_start(self.chk_enable, False, False, 0)
+        self._on_enable_toggled(self.chk_enable)
+
+        # ── buttons ──────────────────────────────────────────────────
+        btn_box = Gtk.Box(spacing=8)
+        btn_box.set_halign(Gtk.Align.END)
+        vbox.pack_start(btn_box, False, False, 0)
+
+        btn_apply = Gtk.Button(label="Apply")
+        btn_apply.connect("clicked", self._on_apply)
+        btn_box.pack_start(btn_apply, False, False, 0)
+
+        btn_close = Gtk.Button(label="Close")
+        btn_close.connect("clicked", lambda _: self._on_close(None, None))
+        btn_box.pack_start(btn_close, False, False, 0)
+
+        self._update_status()
+        self._timer = GLib.timeout_add_seconds(5, self._update_status)
+        self.show_all()
+
+    def _on_enable_toggled(self, chk):
+        active = chk.get_active()
+        self.scale_limit.set_sensitive(active)
+        self.spin_limit.set_sensitive(active)
+
+    def _update_status(self):
+        try:
+            pct, _, status, threshold, health = battery_info()
+            self.lbl_charge.set_text(f"{pct}%")
+            self.lbl_status.set_text(status)
+            self.lbl_threshold.set_text(f"{threshold}%" if threshold < 100 else "None")
+            self.lbl_health.set_text(f"{health}%")
+        except Exception:
+            pass
+        return True
+
+    def _on_apply(self, _btn):
+        if self.chk_enable.get_active():
+            val = int(self.adj_limit.get_value())
+        else:
+            val = 100
+
+        ok = write_threshold(val)
+        if ok:
+            notify("Battery Manager", f"Charge limit set to {val}%.")
+            self._update_status()
+
+    def _on_close(self, _w, _ev):
+        GLib.source_remove(self._timer)
+        self.destroy()
+        self.app.settings_win = None
+        return True
+
+
+# ── Tray application ────────────────────────────────────────────────────
+class BatteryTray:
+    ICON_HYSTERESIS = 4
+
+    def __init__(self):
+        self.settings_win = None
+        self._prev_status = None
+        self._notified_20 = False
+        self._notified_10 = False
+        self._notified_full = False
+        self._shown_pct = None
+        self._shown_level = None
+
+        self.indicator = AyatanaAppIndicator3.Indicator.new(
+            "battery-tray",
+            "battery-good-symbolic",
+            AyatanaAppIndicator3.IndicatorCategory.HARDWARE,
+        )
+        self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+
+        self._build_menu()
+        self._update()
+        GLib.timeout_add_seconds(5, self._update)
+
+    def _icon_level(self, raw_pct):
+        naive = max(0, min(100, round(raw_pct / 10) * 10))
+        if self._shown_level is None:
+            self._shown_level = naive
+            return naive
+        if naive != self._shown_level:
+            if abs(raw_pct - self._shown_level) > (5 + self.ICON_HYSTERESIS):
+                self._shown_level = naive
+        return self._shown_level
+
+    def _build_menu(self):
+        menu = Gtk.Menu()
+
+        self.mi_charge = Gtk.MenuItem(label="—")
+        self.mi_charge.set_sensitive(False)
+        menu.append(self.mi_charge)
+
+        self.mi_limit = Gtk.MenuItem(label="—")
+        self.mi_limit.set_sensitive(False)
+        menu.append(self.mi_limit)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        mi_settings = Gtk.MenuItem(label="Settings...")
+        mi_settings.connect("activate", self._on_settings)
+        menu.append(mi_settings)
+
+        mi_quit = Gtk.MenuItem(label="Quit")
+        mi_quit.connect("activate", lambda _: Gtk.main_quit())
+        menu.append(mi_quit)
+
+        menu.show_all()
+        self.indicator.set_menu(menu)
+
+    def _update(self):
+        try:
+            pct, raw, status, threshold, _ = battery_info()
+        except Exception:
+            return True
+
+        charging = status == "Charging"
+        level = self._icon_level(raw)
+        self.indicator.set_icon_full(icon_for_level(level, charging), f"{pct}%")
+
+        if pct != self._shown_pct:
+            self._shown_pct = pct
+            self.indicator.set_label(f" {pct}%", "")
+
+        self.mi_charge.set_label(f"{pct}% — {status}")
+        if threshold < 100:
+            self.mi_limit.set_label(f"Charge limit: {threshold}%")
+        else:
+            self.mi_limit.set_label("Charge limit: None")
+
+        self._check_notifications(pct, status, threshold)
+        return True
+
+    def _check_notifications(self, pct, status, threshold):
+        if status != self._prev_status:
+            if self._prev_status is not None:
+                self._notified_20 = False
+                self._notified_10 = False
+                self._notified_full = False
+            self._prev_status = status
+
+        if status == "Discharging":
+            if pct <= 10 and not self._notified_10:
+                self._notified_10 = True
+                notify("Battery Critical", f"{pct}% remaining!", "critical")
+            elif pct <= 20 and not self._notified_20:
+                self._notified_20 = True
+                notify("Battery Low", f"{pct}% remaining.", "normal")
+
+        if status in ("Not charging", "Full") and not self._notified_full:
+            if threshold < 100:
+                self._notified_full = True
+                notify("Charge Complete", f"Battery at {pct}%, limit reached.")
+
+    def _on_settings(self, _mi):
+        if self.settings_win is not None:
+            self.settings_win.present()
+            return
+        self.settings_win = SettingsDialog(self)
+
+    def run(self):
+        Gtk.main()
+
+
+if __name__ == "__main__":
+    BatteryTray().run()

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Battery Charge Manager
+Comment=Systray indicator for battery charge threshold management
+Exec=/usr/local/bin/battery-tray
+Icon=battery-good-symbolic
+Terminal=false
+X-XFCE-Autostart=true
