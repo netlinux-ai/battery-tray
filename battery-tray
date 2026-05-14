@@ -9,6 +9,7 @@ persists in SMC NVRAM across reboots.
 
 import os
 import subprocess
+import datetime
 import gi
 
 gi.require_version("Gtk", "3.0")
@@ -44,7 +45,10 @@ def battery_info():
     pct = round(raw)
     health = round(full / design * 100, 1) if design else 0.0
     status = read_str(STATUS_FILE)
-    threshold = read_int(THRESHOLD_FILE)
+    try:
+        threshold = read_int(THRESHOLD_FILE)
+    except FileNotFoundError:
+        threshold = 100
     return pct, raw, status, threshold, health
 
 
@@ -193,6 +197,8 @@ class SettingsDialog(Gtk.Window):
 class BatteryTray:
     ICON_HYSTERESIS = 4
 
+    BCLM_LOG = os.path.expanduser("~/.local/share/battery-tray/bclm.log")
+
     def __init__(self):
         self.settings_win = None
         self._prev_status = None
@@ -201,6 +207,9 @@ class BatteryTray:
         self._notified_full = False
         self._shown_pct = None
         self._shown_level = None
+        self._last_threshold = None
+
+        os.makedirs(os.path.dirname(self.BCLM_LOG), exist_ok=True)
 
         self.indicator = AyatanaAppIndicator3.Indicator.new(
             "battery-tray",
@@ -247,11 +256,38 @@ class BatteryTray:
         menu.show_all()
         self.indicator.set_menu(menu)
 
+    def _log_bclm(self, msg):
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts}  {msg}"
+        print(f"[battery-tray] {line}")
+        try:
+            with open(self.BCLM_LOG, "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    def _check_bclm(self, threshold):
+        if self._last_threshold is None:
+            self._last_threshold = threshold
+            self._log_bclm(f"BCLM initial: {threshold}%")
+            return
+        if threshold != self._last_threshold:
+            old = self._last_threshold
+            self._last_threshold = threshold
+            self._log_bclm(f"BCLM CHANGED: {old}% -> {threshold}%")
+            notify("BCLM Changed!",
+                   f"Charge limit changed from {old}% to {threshold}% "
+                   f"— check {self.BCLM_LOG}", "critical")
+            if threshold == 100 and old < 100:
+                self._log_bclm("BCLM was RESET to 100% — limit removed!")
+
     def _update(self):
         try:
             pct, raw, status, threshold, _ = battery_info()
         except Exception:
             return True
+
+        self._check_bclm(threshold)
 
         charging = status == "Charging"
         level = self._icon_level(raw)
