@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 netlinux-ai and contributors
+
 PREFIX ?= /usr/local
 DESKTOP = battery-tray.desktop
 BIN = $(PREFIX)/bin/battery-tray
