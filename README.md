@@ -150,6 +150,9 @@ persistent file the tray writes is the BCLM change log at
 
 ## License
 
-GPL-2.0 (to be added — currently inherited semantics from
-[`netlinux-ai/applesmc-next`](https://github.com/netlinux-ai/applesmc-next),
-which it depends on).
+[MIT](LICENSE) — do whatever you want with it, as long as you preserve the
+copyright notice and license text in copies or substantial portions of the
+work. The kernel-side dependency
+[`applesmc-next`](https://github.com/netlinux-ai/applesmc-next) is GPL-2.0,
+but this tray app only talks to it through the sysfs interface, so the two
+licenses don't conflict.
